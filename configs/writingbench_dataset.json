@@ -1,0 +1,14 @@
+{
+  "dataset": "X-PLUG/WritingBench",
+  "commit": "ae2d5176449b7b769815482641d35926f26793eb",
+  "url": "https://raw.githubusercontent.com/X-PLUG/WritingBench/ae2d5176449b7b769815482641d35926f26793eb/benchmark_query/benchmark_all.jsonl",
+  "sha256": "18fee37c645166eb2e206b36366b2e354265b1e4201db2c86e759e825eaddcbe",
+  "bytes": 14726077,
+  "language_counts": {
+    "zh": 445,
+    "en": 555
+  },
+  "prompt_format": "Checkpoint chat template, user=query, generation prompt, enable_thinking=False; no query truncation",
+  "selection": "All records with lang == 'en', in source order",
+  "samples": 555
+}

@@ -1,0 +1,1546 @@
+from functools import partial
+from typing import Any, Dict, Optional
+import torch
+from transformers import LogitsProcessorList, PreTrainedTokenizer, StoppingCriteriaList
+from transformers.cache_utils import Cache, DynamicCache
+
+try:
+    from torch.nn.attention.flex_attention import and_masks, create_block_mask
+except ImportError:
+    (and_masks, create_block_mask) = (None, None)
+from setdlm.model.base import DenoiserInput, LossAndNllOutput
+from setdlm.model.bd3lm import BD3LM, BD3LMConfig
+from setdlm.model.diffusion_config import (
+    DiffusionGenerationConfig,
+    DiffusionGenerationOutput,
+    SetDiffusionGenerationConfig,
+    create_attn_mask,
+)
+
+
+def _record_native_uncached_forward_rows(
+    prepared_xt: torch.LongTensor,
+    *,
+    pending_materialization_rows: int,
+    row_cap: int,
+    rows_per_forward: list[int],
+    components_per_forward: list[dict[str, int]],
+) -> int:
+    """Assert and record one native decode forward's realized input width."""
+    if prepared_xt.ndim != 2 or int(prepared_xt.shape[0]) != 1:
+        raise ValueError("native decode inputs must have batch size one")
+    if row_cap <= 0:
+        raise ValueError("uncached decode row cap must be positive")
+    realized_rows = int(prepared_xt.shape[-1])
+    pending_rows = int(pending_materialization_rows)
+    active_rows = realized_rows - pending_rows
+    if pending_rows < 0 or active_rows < 0:
+        raise RuntimeError(
+            f"Prepared decode input is inconsistent with its pending KV-materialization prefix: total={realized_rows}, pending={pending_rows}."
+        )
+    components = {
+        "pending_materialization": pending_rows,
+        "active_query": active_rows,
+        "total": realized_rows,
+    }
+    if realized_rows > int(row_cap):
+        raise AssertionError(
+            f"SetDLM decode forward exceeds the uncached-row cap: realized={realized_rows}, cap={int(row_cap)}, pending_materialization={pending_rows}, active_query={active_rows}."
+        )
+    rows_per_forward.append(realized_rows)
+    components_per_forward.append(components)
+    return realized_rows
+
+
+class SetDLM(BD3LM):
+    """Denoiser class for SetDLM models."""
+
+    _KV_CACHE_POSITION_IDS_KEY = "_setdlm_kv_cache_position_ids"
+    _KV_CACHE_SEMANTICALLY_CROPPED_KEY = "_setdlm_kv_cache_semantically_cropped"
+
+    def __init__(
+        self,
+        config: BD3LMConfig,
+        tokenizer: Optional[PreTrainedTokenizer] = None,
+        **kwargs,
+    ):
+        super().__init__(config, tokenizer, **kwargs)
+        self.block_size = config.block_size
+        if config.attn_backend == "flex_attention":
+            self.static_attention_mask = None
+            self.encoder_static_attention_mask = None
+        self._create_static_mask()
+
+    @staticmethod
+    def _backbone_cache_kwargs(cache: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            k: v
+            for (k, v) in cache.items()
+            if k
+            not in {
+                SetDLM._KV_CACHE_POSITION_IDS_KEY,
+                SetDLM._KV_CACHE_SEMANTICALLY_CROPPED_KEY,
+            }
+        }
+
+    @staticmethod
+    def _select_kv_cache_positions(
+        past_key_values: Any, keep_indices: torch.LongTensor
+    ) -> Any:
+        if past_key_values is None:
+            return past_key_values
+        assert hasattr(past_key_values, "key_cache") and hasattr(
+            past_key_values, "value_cache"
+        ), "DynamicCache-like structure not found"
+        key_cache = getattr(past_key_values, "key_cache")
+        value_cache = getattr(past_key_values, "value_cache")
+        for i in range(len(past_key_values)):
+            k = key_cache[i]
+            v = value_cache[i]
+            if k is None or v is None:
+                continue
+            layer_keep_indices = keep_indices.to(device=k.device)
+            key_cache[i] = k.index_select(dim=-2, index=layer_keep_indices)
+            value_cache[i] = v.index_select(dim=-2, index=layer_keep_indices)
+        return past_key_values
+
+    @staticmethod
+    def _block_mask(
+        b, h, q_idx, kv_idx, seq_length: Optional[int] = None, **kwargs: Any
+    ) -> torch.Tensor:
+        del b, h
+        xt_flag_q = (q_idx >= seq_length).bool()
+        xt_flag_kv = (kv_idx >= seq_length).bool()
+        q_idx = q_idx % seq_length
+        kv_idx = kv_idx % seq_length
+        offset_causal = (q_idx > kv_idx) & ~xt_flag_kv & xt_flag_q
+        diagonal = (q_idx == kv_idx) & (xt_flag_q == xt_flag_kv)
+        causal = (q_idx >= kv_idx) & ~xt_flag_kv & ~xt_flag_q
+        return diagonal | offset_causal | causal
+
+    @staticmethod
+    def _block_mask_eso(
+        b, h, q_idx, kv_idx, seq_length: Optional[int] = None, **kwargs: Any
+    ) -> torch.Tensor:
+        del b, h
+        xt_flag_q = (q_idx >= seq_length).bool()
+        xt_flag_kv = (kv_idx >= seq_length).bool()
+        q_idx = q_idx % seq_length
+        kv_idx = kv_idx % seq_length
+        offset_causal = (q_idx > kv_idx) & ~xt_flag_kv & xt_flag_q
+        diagonal = (q_idx >= kv_idx) & (xt_flag_q == xt_flag_kv)
+        causal = (q_idx >= kv_idx) & ~xt_flag_kv & ~xt_flag_q
+        return diagonal | offset_causal | causal
+
+    def _create_static_mask(self) -> None:
+        if self.config.attn_backend == "flex_attention":
+            seq_length = self.config.length
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                return self._block_mask(b, h, q_idx, kv_idx, seq_length=seq_length)
+
+            self.static_attention_mask = create_block_mask(
+                mask_mod,
+                B=None,
+                H=None,
+                Q_LEN=self.config.length * 2,
+                KV_LEN=self.config.length * 2,
+            )
+        elif self.config.attn_backend == "sdpa":
+            if getattr(self.config, "inefficient_training", False):
+                mask = self._block_mask_eso(
+                    b=None,
+                    h=None,
+                    q_idx=torch.arange(self.config.length * 2)[:, None],
+                    kv_idx=torch.arange(self.config.length * 2)[None, :],
+                    seq_length=self.config.length,
+                )
+            else:
+                mask = self._block_mask(
+                    b=None,
+                    h=None,
+                    q_idx=torch.arange(self.config.length * 2)[:, None],
+                    kv_idx=torch.arange(self.config.length * 2)[None, :],
+                    seq_length=self.config.length,
+                )
+            self.register_buffer("static_attention_mask", mask)
+        else:
+            raise ValueError("Unknown attention backend")
+
+    def _new_generation_cache(
+        self, batch_size: int, device: torch.device | str
+    ) -> Dict[str, Any]:
+        del batch_size, device
+        return {"past_key_values": DynamicCache()}
+
+    def _backbone_forward(self, denoiser_inputs: DenoiserInput, **backbone_kwargs: Any):
+        return super()._backbone_forward(denoiser_inputs, **backbone_kwargs)
+
+    def _compute_loss(
+        self,
+        model_output: torch.FloatTensor,
+        denoiser_inputs: DenoiserInput,
+        **kwargs: Any,
+    ) -> LossAndNllOutput:
+        input_length = denoiser_inputs.x0.shape[1]
+        model_output = model_output[:, input_length : input_length * 2, ...]
+        log_p_theta = torch.gather(
+            input=model_output, dim=-1, index=denoiser_inputs.x0[:, :, None]
+        ).squeeze(-1)
+        if getattr(self.config, "keep_clean_bos", False) and (not self.training):
+            log_p_theta = log_p_theta[:, 1:]
+            denoiser_inputs.tokens_mask = denoiser_inputs.tokens_mask[:, 1:]
+            denoiser_inputs.x0 = denoiser_inputs.x0[:, 1:]
+            denoiser_inputs.attention_mask = denoiser_inputs.attention_mask[:, 1:]
+            denoiser_inputs.alpha_t_prime = denoiser_inputs.alpha_t_prime[:, 1:]
+            denoiser_inputs.alpha_t = denoiser_inputs.alpha_t[:, 1:]
+        loss = -log_p_theta
+        if not self.training:
+            denoiser_inputs.tokens_mask = denoiser_inputs.tokens_mask * (
+                denoiser_inputs.x0 != self.pad_token_id
+            )
+        inefficient_eval = getattr(self.config, "inefficient_training", False)
+        if not self.training and inefficient_eval and (self.config.block_size > 1):
+            coeff = denoiser_inputs.alpha_t_prime / (1 - denoiser_inputs.alpha_t)
+            coeff = torch.nan_to_num(coeff, nan=0.0, posinf=0.0, neginf=0.0)
+            seq_len = denoiser_inputs.x0.shape[1]
+            masked_indices = denoiser_inputs.xt[:, -seq_len:] == self.mask_token_id
+            nlls = log_p_theta * coeff * masked_indices
+        else:
+            nlls = loss * denoiser_inputs.tokens_mask
+            if getattr(self.config, "inefficient_training", False):
+                nlls *= denoiser_inputs.alpha_t_prime != 0.0
+        count = denoiser_inputs.tokens_mask.sum(dim=-1)
+        batch_nll = nlls.sum(dim=-1)
+        token_nll = torch.where(
+            count > 0, batch_nll / count, torch.zeros_like(batch_nll)
+        ).mean()
+        permutation_order = denoiser_inputs.backbone_kwargs.get("permutation_order")
+        other_loss_terms = {}
+        if permutation_order is not None:
+            other_loss_terms["permutation_order"] = permutation_order
+            other_loss_terms["attention_mask"] = denoiser_inputs.attention_mask
+            other_loss_terms["log_p_theta"] = -log_p_theta * denoiser_inputs.tokens_mask
+        return LossAndNllOutput(
+            loss=token_nll, nlls=nlls, other_loss_terms=other_loss_terms
+        )
+
+    def _prepare_inputs(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.FloatTensor | None = None,
+        context_mask: torch.FloatTensor | None = None,
+        t: torch.FloatTensor | None = None,
+        past_key_values: Cache | None = None,
+    ):
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        if context_mask is None:
+            context_mask = torch.zeros_like(attention_mask)
+        if torch.is_floating_point(attention_mask):
+            attention_mask = attention_mask.to(torch.int)
+            context_mask = context_mask.to(torch.int)
+        if t is None:
+            t = torch.rand(
+                input_ids.shape[0],
+                input_ids.shape[1] // self.config.block_size,
+                device=input_ids.device,
+            ).repeat_interleave(self.config.block_size, dim=-1)
+        (alpha_t, alpha_t_prime) = self.noise_schedule(t)
+        while alpha_t.ndim < 2:
+            alpha_t = alpha_t[..., None]
+            alpha_t_prime = alpha_t_prime[..., None]
+        noise_mask = context_mask | ~attention_mask.bool()
+        permute_flag = noise_mask != 1
+        if getattr(self.config, "keep_clean_bos", False):
+            permute_flag[:, 0] = False
+        perm_indices = None
+        xt = input_ids.clone()
+        evaluate_nll_flag = getattr(self.config, "inefficient_training", False)
+        if not evaluate_nll_flag:
+            xt = torch.where(
+                (attention_mask == 1) & (context_mask == 0), self.mask_token_id, xt
+            )
+        else:
+            xt = self._sample_q_xt(x0=input_ids, alpha_t=alpha_t, mask=noise_mask)
+            if getattr(self.config, "inefficient_training", False):
+                xt = torch.where(alpha_t_prime != 0.0, self.mask_token_id, xt)
+        (batch_size, seq_len) = input_ids.shape
+        num_repetitions = 2
+        if permute_flag.any():
+            with torch.no_grad():
+                perm_indices = self.noise_schedule.sample_permutation_order(
+                    t,
+                    permute_flag,
+                    self.config.block_size
+                    if self.training
+                    else self.config.eval_block_size,
+                    masked_tokens=xt == self.mask_token_id
+                    if evaluate_nll_flag
+                    else None,
+                )
+        else:
+            perm_indices = torch.arange(seq_len, device=input_ids.device)[None, :]
+        if (
+            self.training
+            and getattr(self.config, "setdlm_eos_last_in_target_order", False)
+            and (getattr(self.config, "eos_token_id", None) is not None)
+        ):
+            perm_indices = self._move_target_eos_to_end_of_permutation(
+                perm_indices=perm_indices,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                context_mask=context_mask,
+                eos_token_id=int(self.config.eos_token_id),
+            )
+        alpha_t = torch.gather(alpha_t, dim=-1, index=perm_indices)
+        alpha_t_prime = torch.gather(alpha_t_prime, dim=-1, index=perm_indices)
+        if self.config.attn_backend == "sdpa":
+            decoder_attention_mask = (
+                self.static_attention_mask[None, ...]
+                & attention_mask.repeat(1, num_repetitions)[:, None, :]
+                & attention_mask.repeat(1, num_repetitions)[..., None]
+            )
+        elif self.config.attn_backend == "flex_attention":
+            if context_mask.any():
+                raise NotImplementedError(
+                    "flex_attention with context_mask not implemented yet."
+                )
+            elif attention_mask is not None and (attention_mask != 1).any():
+                padding_mask = create_attn_mask(attention_mask.repeat(1, 2).bool())
+                dec_masks = [
+                    partial(
+                        self._block_mask,
+                        block_size=self.config.block_size
+                        if self.training
+                        else self.config.eval_block_size,
+                        seq_length=self.config.length,
+                    ),
+                    padding_mask,
+                ]
+                decoder_attention_mask = create_block_mask(
+                    and_masks(*dec_masks),
+                    B=input_ids.shape[0],
+                    H=None,
+                    Q_LEN=input_ids.shape[1] * 2,
+                    KV_LEN=input_ids.shape[1] * 2,
+                )
+            else:
+                decoder_attention_mask = self.static_attention_mask
+        else:
+            raise ValueError("Unknown attention backend")
+        xt = torch.gather(xt, dim=-1, index=perm_indices)
+        input_ids = torch.gather(input_ids, dim=-1, index=perm_indices)
+        position_ids = torch.arange(input_ids.shape[1], device=input_ids.device)[
+            None, :
+        ].repeat(batch_size, 1)
+        position_ids = torch.gather(position_ids, dim=-1, index=perm_indices)
+        if evaluate_nll_flag:
+            xt = xt.repeat(1, 2)
+        else:
+            xt = torch.cat((input_ids, xt), dim=-1)
+        position_ids = position_ids.repeat(1, num_repetitions)
+        if evaluate_nll_flag:
+            assert self.config.attn_backend == "sdpa", (
+                "eval_nll flag only supported for sdpa backend"
+            )
+            for i in range(batch_size):
+                if self.mask_token_id not in xt[i]:
+                    continue
+                first_mask_token_idx = (
+                    (xt[i] == self.mask_token_id).float().argmax().item()
+                )
+                masked_indices = torch.arange(
+                    first_mask_token_idx + seq_len, seq_len * 2
+                )
+                clean_indices = torch.arange(seq_len, first_mask_token_idx + seq_len)
+                decoder_attention_mask[i][
+                    masked_indices[:, None], clean_indices[None, :]
+                ] = False
+                decoder_attention_mask[i][
+                    masked_indices[:, None], masked_indices[None, :] - seq_len
+                ] = False
+        if self.config.attn_backend == "sdpa":
+            decoder_attention_mask = self._preprocess_attention_mask(
+                decoder_attention_mask[:, None], dtype=torch.float
+            )
+        tokens_mask = attention_mask * (1 - context_mask)
+        return DenoiserInput(
+            xt=xt,
+            x0=input_ids,
+            attention_mask=decoder_attention_mask,
+            tokens_mask=tokens_mask,
+            t=t,
+            alpha_t=alpha_t,
+            alpha_t_prime=alpha_t_prime,
+            backbone_kwargs={
+                "position_ids": position_ids,
+                "permutation_order": perm_indices,
+            },
+        )
+
+    def update_cache(
+        self,
+        inputs: torch.LongTensor,
+        cache: Optional[Dict[str, Any]] = None,
+        first_hitting_times: Optional[torch.LongTensor] = None,
+        **backbone_kwargs: Any,
+    ) -> Dict[str, Any]:
+        """
+        Cache the key-value pairs for the context.
+        Args:
+            inputs (torch.LongTensor): The context tensor.
+            cache (Dict[str, Any | None): Cache objects, e.g., past_key_values.
+        Returns:
+            Dict: Updated cache objects, e.g., past_key_values.
+        """
+        (context_input, cache) = self._prepare_inputs_inference(
+            input_ids=inputs,
+            cache=cache,
+            return_updated_cache=True,
+            first_hitting_times=first_hitting_times,
+            **backbone_kwargs,
+        )
+        backbone_output = self._backbone_forward(
+            context_input, **self._backbone_cache_kwargs(cache)
+        )
+        backbone_output = {k: v for (k, v) in backbone_output.items()}
+        backbone_output.pop("logits", None)
+        cache = cache | backbone_output
+        if getattr(self.config, "setdlm_fht_cache_order", False):
+            prepared_position_ids = context_input.backbone_kwargs.get("position_ids")
+            if prepared_position_ids is not None:
+                cache[self._KV_CACHE_POSITION_IDS_KEY] = prepared_position_ids.clone()
+        return cache
+
+    @staticmethod
+    def _patch_decode_attention_mask_from_input_mask(
+        base: torch.Tensor, input_mask: torch.Tensor
+    ) -> torch.Tensor:
+        seq_len = input_mask.shape[-1]
+        edit = torch.zeros_like(base, dtype=torch.bool)
+        diag_r = torch.arange(seq_len, device=base.device)
+        diag_c = base.size(1) - seq_len + diag_r
+        edit[diag_r, diag_c] = True
+        patched = torch.zeros_like(base, dtype=torch.bool)
+        mask_pair = input_mask[0, :, None] & input_mask[0, None, :]
+        patched[:, -seq_len:] = mask_pair
+        return torch.where(patched, edit, base)
+
+    def _semantic_attention_base(
+        self,
+        *,
+        query_position_ids: torch.LongTensor,
+        key_position_ids: torch.LongTensor,
+        seq_length: int,
+    ) -> torch.Tensor:
+        return self._block_mask(
+            b=None,
+            h=None,
+            q_idx=query_position_ids[0, :, None],
+            kv_idx=key_position_ids[0, None, :],
+            seq_length=seq_length,
+        )
+
+    def _prepare_inputs_inference(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.FloatTensor | None = None,
+        context: torch.LongTensor | None = None,
+        context_mask: torch.FloatTensor | None = None,
+        cache: Optional[Dict[str, Any]] = None,
+        return_updated_cache: bool = False,
+        position_ids: torch.LongTensor | None = None,
+        first_hitting_times: torch.LongTensor | None = None,
+        **backbone_kwargs: Any,
+    ) -> DenoiserInput:
+        assert input_ids is not None or context is not None, (
+            "Must provide either input_ids or context."
+        )
+        device = input_ids.device
+        seq_len = input_ids.shape[1]
+        cache = cache if cache is not None else {}
+        past_key_values = cache.pop("past_key_values", DynamicCache())
+        cache_len = self._get_past_key_values_seq_length(past_key_values)
+        full_seq_length = cache_len + seq_len
+        cache_position_ids = cache.get(self._KV_CACHE_POSITION_IDS_KEY)
+        if cache_position_ids is not None:
+            assert cache_position_ids.shape[-1] == cache_len, (
+                "KV cache position ledger length must match KV cache length"
+            )
+        fht_permuted_cache_order = bool(
+            getattr(self.config, "setdlm_fht_cache_order", False)
+            and first_hitting_times is not None
+        )
+        if fht_permuted_cache_order and cache_position_ids is None and (cache_len == 0):
+            cache_position_ids = position_ids[:, :0]
+            cache[self._KV_CACHE_POSITION_IDS_KEY] = cache_position_ids
+        if full_seq_length > self.config.length:
+            overflow = full_seq_length - self.config.length
+            if fht_permuted_cache_order:
+                if cache_position_ids is None:
+                    raise ValueError(
+                        "setdlm_fht_cache_order requires a KV cache position ledger before overflow cropping."
+                    )
+                keep_len = cache_len - overflow
+                assert keep_len > 0, "cache_len must remain greater than 0"
+                semantic_keep = cache_position_ids[0].argsort(stable=True)[overflow:]
+                keep_indices = semantic_keep.sort().values
+                past_key_values = self._select_kv_cache_positions(
+                    past_key_values, keep_indices
+                )
+                cache_position_ids = cache_position_ids.index_select(
+                    dim=-1, index=keep_indices.to(device=cache_position_ids.device)
+                )
+                cache[self._KV_CACHE_POSITION_IDS_KEY] = cache_position_ids
+                cache[self._KV_CACHE_SEMANTICALLY_CROPPED_KEY] = True
+            else:
+                past_key_values = self._crop_kv_cache_left(past_key_values, overflow)
+                if cache_position_ids is not None:
+                    cache[self._KV_CACHE_POSITION_IDS_KEY] = cache_position_ids[
+                        :, overflow:
+                    ]
+            cache_len -= overflow
+            full_seq_length = cache_len + input_ids.shape[-1]
+            assert cache_len > 0, "cache_len must be greater than 0"
+            assert cache_len + seq_len <= self.config.length, (
+                "full seq length must be less than or equal to length"
+            )
+        perm_indices = None
+        if first_hitting_times is not None:
+            fhs = torch.where(
+                input_ids == self.mask_token_id, -1000000.0, first_hitting_times
+            )
+            perm_indices = fhs.argsort(dim=-1, stable=True, descending=True)
+        else:
+            cache_flag = (input_ids != self.mask_token_id).float()
+            perm_indices = cache_flag.argsort(dim=-1, stable=True, descending=True)
+        if return_updated_cache:
+            position_ids = torch.gather(position_ids, dim=-1, index=perm_indices)
+            input_ids = torch.gather(input_ids, dim=-1, index=perm_indices)
+            if cache.get(self._KV_CACHE_SEMANTICALLY_CROPPED_KEY, False):
+                if cache_position_ids is None:
+                    raise ValueError(
+                        "setdlm_fht_cache_order requires a KV cache position ledger before building the decode attention mask."
+                    )
+                key_position_ids = torch.cat((cache_position_ids, position_ids), dim=-1)
+                base = self._semantic_attention_base(
+                    query_position_ids=position_ids,
+                    key_position_ids=key_position_ids,
+                    seq_length=self.config.length,
+                )
+            else:
+                base = self.static_attention_mask[
+                    cache_len : cache_len + seq_len, : cache_len + seq_len
+                ]
+            input_mask = input_ids == self.mask_token_id
+            edit = torch.zeros_like(base, dtype=torch.bool)
+            diag_r = torch.arange(seq_len, device=base.device)
+            diag_c = base.size(1) - seq_len + diag_r
+            edit[diag_r, diag_c] = True
+            if input_mask.any():
+                first_mask_token_idx = self._value_to_int(
+                    input_mask.float().argmax(dim=-1)[0]
+                )
+            else:
+                first_mask_token_idx = seq_len
+            patched = torch.zeros_like(base)
+            if first_mask_token_idx < seq_len:
+                num_masked_tokens = seq_len - first_mask_token_idx
+                patched[-num_masked_tokens:, -num_masked_tokens:] = True
+            attention_mask = torch.where(patched, edit, base)
+            attention_mask = self._preprocess_attention_mask(
+                attention_mask[None, None, ...], dtype=torch.float
+            )
+        else:
+            full_possible_len = self.static_attention_mask.shape[-1] // 2
+            if cache.get(self._KV_CACHE_SEMANTICALLY_CROPPED_KEY, False):
+                if cache_position_ids is None:
+                    raise ValueError(
+                        "setdlm_fht_cache_order requires a KV cache position ledger before building the decode attention mask."
+                    )
+                key_position_ids = torch.cat(
+                    (cache_position_ids, position_ids + full_possible_len), dim=-1
+                )
+                base = self._semantic_attention_base(
+                    query_position_ids=position_ids,
+                    key_position_ids=key_position_ids,
+                    seq_length=full_possible_len,
+                )
+            else:
+                valid_attn_indices = torch.cat(
+                    (
+                        torch.arange(cache_len, device=device),
+                        torch.arange(cache_len, cache_len + seq_len, device=device)
+                        + full_possible_len,
+                    )
+                )
+                base = self.static_attention_mask[
+                    cache_len : cache_len + seq_len, valid_attn_indices
+                ]
+            row = torch.arange(seq_len, device=device)
+            col = cache_len + row
+            diag_mask = torch.zeros_like(base, dtype=torch.bool)
+            diag_mask[row, col] = True
+            attention_mask = torch.where(diag_mask, torch.ones_like(base), base)
+            attention_mask = self._preprocess_attention_mask(
+                attention_mask[None, None, ...], dtype=torch.float
+            )
+        return (
+            DenoiserInput(
+                xt=input_ids,
+                attention_mask=attention_mask,
+                context_mask=context_mask,
+                past_key_values=past_key_values,
+                backbone_kwargs={
+                    "position_ids": position_ids,
+                    "permutation_order": perm_indices,
+                    "return_updated_cache": return_updated_cache,
+                }
+                | backbone_kwargs,
+            ),
+            cache,
+        )
+
+    @staticmethod
+    def _value_to_int(value: Any) -> int:
+        return int(value.item()) if hasattr(value, "item") else int(value)
+
+    @staticmethod
+    def _ranks_from_permutation(perm_indices: torch.LongTensor) -> torch.LongTensor:
+        ranks = torch.empty_like(perm_indices)
+        order = torch.arange(
+            perm_indices.shape[-1], device=perm_indices.device, dtype=perm_indices.dtype
+        )[None, :].expand_as(perm_indices)
+        ranks.scatter_(dim=-1, index=perm_indices, src=order)
+        return ranks
+
+    @staticmethod
+    def _move_target_eos_to_end_of_permutation(
+        perm_indices: torch.LongTensor,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        context_mask: torch.Tensor,
+        eos_token_id: int,
+    ) -> torch.LongTensor:
+        attention = attention_mask.to(device=input_ids.device, dtype=torch.bool)
+        context = context_mask.to(device=input_ids.device, dtype=torch.bool)
+        target = attention & ~context
+        target_eos = target & (input_ids == int(eos_token_id))
+        if not target_eos.any():
+            return perm_indices
+        reordered = torch.empty_like(perm_indices)
+        for batch_idx in range(perm_indices.shape[0]):
+            order = perm_indices[batch_idx]
+            ordered_attention = attention[batch_idx, order]
+            ordered_context = context[batch_idx, order]
+            ordered_target = target[batch_idx, order]
+            ordered_eos = target_eos[batch_idx, order]
+            pieces = (
+                order[ordered_attention & ordered_context],
+                order[ordered_target & ~ordered_eos],
+                order[ordered_target & ordered_eos],
+                order[~ordered_attention],
+            )
+            reordered[batch_idx] = torch.cat(pieces, dim=0)
+        return reordered
+
+    @staticmethod
+    def _train_order_active_mask(
+        *,
+        accumulated_samples: torch.LongTensor,
+        cache_flag: torch.BoolTensor,
+        train_order_ranks: torch.LongTensor,
+        target_start_idx: int,
+        target_end_idx: int,
+        inputs_offset: int,
+        window_size: int,
+        mask_token_id: int,
+        pad_token_id: Optional[int],
+    ) -> tuple[torch.BoolTensor, int]:
+        batch_size = accumulated_samples.shape[0]
+        target_positions = torch.arange(
+            target_start_idx, target_end_idx, device=accumulated_samples.device
+        )[None, :].expand(batch_size, -1)
+        target_ranks = torch.gather(train_order_ranks, dim=-1, index=target_positions)
+        sorted_target_idx = target_ranks.argsort(dim=-1, stable=True)
+        sorted_positions = torch.gather(
+            target_positions, dim=-1, index=sorted_target_idx
+        )
+        sorted_tokens = torch.gather(
+            accumulated_samples, dim=-1, index=sorted_positions
+        )
+        sorted_cached = torch.gather(cache_flag, dim=-1, index=sorted_positions)
+        visible = sorted_tokens != mask_token_id
+        if pad_token_id is not None:
+            visible = visible & (sorted_tokens != pad_token_id)
+        uncached_visible = visible & ~sorted_cached
+        uncached_missing = ~visible & ~sorted_cached
+        blocked_by_earlier_missing = uncached_missing.cumsum(dim=-1) > 0
+        promotable = uncached_visible & ~blocked_by_earlier_missing
+        masked_uncached = (sorted_tokens == mask_token_id) & ~sorted_cached
+        active_masked = masked_uncached & (
+            masked_uncached.cumsum(dim=-1) <= int(window_size)
+        )
+        active_sorted = promotable | active_masked
+        active_absolute = torch.zeros_like(cache_flag, dtype=torch.bool)
+        active_absolute.scatter_(dim=-1, index=sorted_positions, src=active_sorted)
+        active_relative = active_absolute[:, inputs_offset:]
+        clean_len = int(promotable.sum(dim=-1).min().item())
+        return (active_relative, clean_len)
+
+    @staticmethod
+    def _sort_relative_indices_by_train_order(
+        *,
+        relative_indices: torch.LongTensor,
+        train_order_ranks: torch.LongTensor,
+        inputs_offset: int,
+    ) -> torch.LongTensor:
+        absolute_indices = relative_indices + int(inputs_offset)
+        order_values = torch.gather(train_order_ranks, dim=-1, index=absolute_indices)
+        order = order_values.argsort(dim=-1, stable=True)
+        return torch.gather(relative_indices, dim=-1, index=order)
+
+    def _sample_prior(
+        self,
+        inputs: torch.LongTensor,
+        generation_config: DiffusionGenerationConfig,
+        batch_size: int,
+        max_new_tokens: int,
+        block_size: int,
+        is_infill_task: bool,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    ) -> torch.LongTensor:
+        if is_infill_task:
+            num_mask_tokens = (inputs == self.mask_token_id).sum()
+        else:
+            num_mask_tokens = max_new_tokens
+        if is_infill_task:
+            masked_tensor = inputs
+        else:
+            masked_tensor = self.mask_token_id * torch.ones(
+                (batch_size, num_mask_tokens), dtype=torch.int64, device=device
+            )
+            if inputs is not None:
+                masked_tensor = torch.cat([inputs, masked_tensor], dim=-1)
+        return masked_tensor
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        inputs: torch.LongTensor | None = None,
+        generation_config: SetDiffusionGenerationConfig | None = None,
+        logits_processor: LogitsProcessorList | None = None,
+        stopping_criteria: StoppingCriteriaList | None = None,
+        max_length: int | None = None,
+        max_new_tokens: int | None = None,
+        return_dict_in_generate: Optional[bool] = False,
+        batch_size: int = 1,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        tokenizer: PreTrainedTokenizer | None = None,
+        **kwargs: Any,
+    ) -> torch.LongTensor:
+        generation_trace = kwargs.pop("generation_trace", None)
+        if generation_trace is not None and (not isinstance(generation_trace, list)):
+            raise TypeError("generation_trace must be a list when supplied.")
+        generation_trace_top_k = int(kwargs.pop("generation_trace_top_k", 0))
+        if generation_trace_top_k < 0:
+            raise ValueError("generation_trace_top_k must be nonnegative.")
+        max_uncached_decode_rows_per_forward = int(
+            kwargs.pop("max_uncached_decode_rows_per_forward", 128)
+        )
+        if max_uncached_decode_rows_per_forward <= 0:
+            raise ValueError("max_uncached_decode_rows_per_forward must be positive.")
+        generation_stop_token_ids = tuple(
+            (int(token_id) for token_id in kwargs.pop("generation_stop_token_ids", ()))
+        )
+        generation_stop_sequences = tuple(
+            (
+                tuple((int(token_id) for token_id in sequence))
+                for sequence in kwargs.pop("generation_stop_sequences", ())
+            )
+        ) + tuple(((token_id,) for token_id in generation_stop_token_ids))
+        if any((not sequence for sequence in generation_stop_sequences)):
+            raise ValueError("generation stop sequences must be nonempty")
+        if generation_config is None:
+            assert getattr(self, "generation_config", None) is not None, (
+                "Generation config must be provided if not present in the model."
+            )
+            generation_config = self.generation_config
+        assert generation_config.use_cache, (
+            "Generation with SetDLM requires use_cache=True."
+        )
+        input_length = inputs.shape[-1] if inputs is not None else 0
+        batch_size = inputs.shape[0] if inputs is not None else batch_size
+        assert batch_size == 1, "only batch size 1 supported for inference"
+        (max_length, max_new_tokens) = self._compute_sampling_lengths(
+            generation_config=generation_config,
+            input_length=input_length,
+            max_new_tokens=max_new_tokens,
+            max_length=max_length,
+        )
+        is_infill_task = inputs is not None and self.mask_token_id in inputs
+        if is_infill_task and generation_stop_sequences:
+            raise ValueError(
+                "Terminator-aware generation currently supports continuation decoding, not infilling."
+            )
+        use_fht_cache_order = bool(
+            getattr(self.config, "setdlm_fht_cache_order", False)
+            and (not is_infill_task)
+            and (not getattr(generation_config, "align_inputs_to_blocks", False))
+        )
+        block_size = generation_config.block_size
+        assert block_size == self.config.length, "ao-bd3lm not supported yet"
+        pad_length = None
+        if is_infill_task:
+            all_position_ids = torch.arange(input_length, device=device)[
+                None, :
+            ].repeat(batch_size, 1)
+        else:
+            all_position_ids = torch.arange(
+                input_length + max_new_tokens, device=device
+            )[None, :].repeat(batch_size, 1)
+        if is_infill_task:
+            num_mask_tokens = (inputs == self.mask_token_id).sum()
+            first_mask_token_idx = (
+                (inputs == self.mask_token_id).float().argmax(dim=-1)[0]
+            )
+            last_mask_token_idx = (inputs != self.mask_token_id).float()[
+                :, first_mask_token_idx:
+            ].argmax(dim=-1)[0] + first_mask_token_idx
+            inputs_offset = 0
+        else:
+            num_mask_tokens = max_new_tokens
+            first_mask_token_idx = input_length
+            last_mask_token_idx = input_length + max_new_tokens
+            inputs_offset = input_length
+        accumulated_samples = self._sample_prior(
+            inputs=inputs,
+            batch_size=batch_size,
+            generation_config=generation_config,
+            max_new_tokens=max_new_tokens,
+            block_size=block_size,
+            is_infill_task=is_infill_task,
+            device=device,
+        )
+        accumulated_confidence = torch.full(
+            accumulated_samples.shape, float("nan"), dtype=torch.float32, device=device
+        )
+        accumulated_confidence[accumulated_samples != self.mask_token_id] = 1.0
+        confidence_state: Dict[str, torch.Tensor] = {}
+        cache_flag = torch.zeros_like(accumulated_samples, dtype=torch.bool)
+        if input_length > 0 and (not is_infill_task):
+            cache_flag[:, :first_mask_token_idx] = True
+        infill_cache_promotion_order = getattr(
+            generation_config, "setdlm_infill_cache_promotion_order", "l2r"
+        )
+        if infill_cache_promotion_order not in {"l2r", "first_hitting"}:
+            raise ValueError(
+                f"setdlm_infill_cache_promotion_order must be one of ['first_hitting', 'l2r'], got {infill_cache_promotion_order!r}"
+            )
+        use_first_hitting_order_in_decode = not is_infill_task and getattr(
+            generation_config, "use_first_hitting_order_in_decode", False
+        )
+        decode_first_hitting_length = None
+        timestep_first_hitting_times = None
+        decode_order_first_hitting_times = None
+        decode_train_order_permutation = None
+        decode_train_order_ranks = None
+        if (
+            generation_config.first_hitting
+            and generation_config.sampling_strategy == "posterior"
+        ):
+            timestep_first_hitting_times = (
+                self.noise_schedule.compute_first_hitting_times(
+                    batch_size=1, length=num_mask_tokens, device=device
+                )[0]
+            )
+            decode_first_hitting_length = num_mask_tokens
+        if use_first_hitting_order_in_decode:
+            if accumulated_samples.shape[-1] > self.config.length:
+                raise ValueError(
+                    f"SetDLM train-order decode requires the sampled sequence to fit within config.length={self.config.length}, got {accumulated_samples.shape[-1]}."
+                )
+            decode_first_hitting_length = self.config.length
+            train_order_t = torch.ones(
+                batch_size, self.config.length, device=device, dtype=torch.float32
+            )
+            train_order_target_mask = torch.zeros(
+                batch_size, self.config.length, device=device, dtype=torch.bool
+            )
+            target_order_end = min(
+                int(input_length + max_new_tokens), self.config.length
+            )
+            train_order_target_mask[:, int(input_length) : target_order_end] = True
+            decode_train_order_permutation = (
+                self.noise_schedule.sample_permutation_order(
+                    train_order_t, train_order_target_mask, self.config.block_size
+                )
+            )
+            decode_train_order_ranks = self._ranks_from_permutation(
+                decode_train_order_permutation
+            )
+            decode_order_scores = (self.config.length - decode_train_order_ranks).to(
+                torch.float32
+            )
+            decode_order_first_hitting_times = decode_order_scores[
+                :, inputs_offset : inputs_offset + max_new_tokens
+            ]
+        if use_fht_cache_order:
+            decode_first_hitting_length = self._value_to_int(num_mask_tokens)
+            decode_order_first_hitting_times = (
+                self.noise_schedule.compute_first_hitting_times(
+                    batch_size=batch_size,
+                    length=decode_first_hitting_length,
+                    device=device,
+                )
+            )
+        xt = accumulated_samples[:, inputs_offset:]
+        timesteps = self._sample_generation_timesteps(
+            generation_config,
+            max_length=num_mask_tokens,
+            device=device,
+            first_hitting_times=timestep_first_hitting_times,
+        )
+        timesteps = timesteps[None, :].repeat(batch_size, 1)
+        xt_position_ids = all_position_ids[:, inputs_offset:]
+        all_masked_positions = xt == self.mask_token_id
+        max_window_size = getattr(generation_config, "max_window_size", None)
+        if max_window_size is None:
+            max_window_size = kwargs.get("max_window_size")
+        schedule_window_size = self.noise_schedule.compute_window_size()
+        if max_window_size is None:
+            max_window_size = schedule_window_size
+        if max_window_size is None:
+            max_window_size = self.config.block_size
+        if schedule_window_size is None:
+            schedule_window_size = max_window_size
+        window_size = min(int(schedule_window_size), int(max_window_size))
+        if use_first_hitting_order_in_decode and decode_train_order_ranks is not None:
+            (masked_positions, clean_len) = self._train_order_active_mask(
+                accumulated_samples=accumulated_samples,
+                cache_flag=cache_flag,
+                train_order_ranks=decode_train_order_ranks,
+                target_start_idx=int(input_length),
+                target_end_idx=int(input_length + max_new_tokens),
+                inputs_offset=int(inputs_offset),
+                window_size=int(window_size),
+                mask_token_id=self.mask_token_id,
+                pad_token_id=self.pad_token_id,
+            )
+            window_start = (
+                inputs_offset + masked_positions.float().argmax(dim=-1)[:, None]
+            )
+        else:
+            masked_positions = all_masked_positions
+            window_start = (
+                inputs_offset + masked_positions.float().argmax(dim=-1)[:, None]
+            )
+            masked_positions = masked_positions & (
+                xt_position_ids < window_start + window_size
+            )
+        self._value_to_int(num_mask_tokens)
+        infill_cache_first_hitting_times = None
+        infill_cache_first_hitting_length = None
+        if is_infill_task:
+            infill_cache_first_hitting_length = accumulated_samples.shape[-1]
+            if infill_cache_promotion_order == "first_hitting":
+                infill_cache_first_hitting_times = (
+                    self.noise_schedule.compute_first_hitting_times(
+                        batch_size=batch_size,
+                        length=infill_cache_first_hitting_length,
+                        device=device,
+                    )
+                )
+        if input_length > 0:
+            if is_infill_task and getattr(
+                generation_config, "cache_full_infill_context", False
+            ):
+                cache_flag = accumulated_samples != self.mask_token_id
+                inputs_indices = cache_flag.nonzero(as_tuple=False)[:, 1].sort().values
+                if inputs_indices.numel() > self.config.length:
+                    inputs_indices = inputs_indices[-self.config.length :]
+                    cache_flag = torch.zeros_like(accumulated_samples, dtype=torch.bool)
+                    cache_flag[:, inputs_indices] = True
+            else:
+                cache_flag = torch.zeros_like(accumulated_samples, dtype=torch.bool)
+                cache_flag[:, :first_mask_token_idx] = True
+                first_mask_token_idx_value = (
+                    first_mask_token_idx.item()
+                    if hasattr(first_mask_token_idx, "item")
+                    else first_mask_token_idx
+                )
+                inputs_indices = torch.arange(
+                    int(first_mask_token_idx_value), device=device
+                )
+            cache = self._new_generation_cache(batch_size=batch_size, device=device)
+            initial_cache_first_hitting_times = None
+            if (
+                is_infill_task
+                and infill_cache_promotion_order == "first_hitting"
+                and (infill_cache_first_hitting_times is not None)
+            ):
+                initial_cache_first_hitting_times = torch.gather(
+                    infill_cache_first_hitting_times,
+                    dim=-1,
+                    index=inputs_indices[None, :].expand(batch_size, -1),
+                )
+            cache = self.update_cache(
+                inputs=inputs[:, inputs_indices],
+                position_ids=all_position_ids[:, inputs_indices],
+                cache=cache,
+                first_hitting_times=initial_cache_first_hitting_times,
+            )
+        else:
+            cache = self._new_generation_cache(batch_size=batch_size, device=device)
+            inputs_indices = torch.empty(0, device=device)
+            if getattr(self.config, "setdlm_fht_cache_order", False):
+                cache[self._KV_CACHE_POSITION_IDS_KEY] = all_position_ids[:, :0]
+        total_NFEs = 0
+        is_done = torch.Tensor([False])
+        num_tokens_generated_per_step = []
+        uncached_rows_per_forward: list[int] = []
+        uncached_row_components_per_forward: list[dict[str, int]] = []
+        block_NFEs = 0
+        clean_len = 0
+        termination_position = None
+        termination_token_id = None
+        termination_detected_at_step = None
+        for i in range(timesteps.shape[-1]):
+            block_NFEs += 1
+            total_NFEs += 1
+            t = timesteps[:, i]
+            if generation_config.first_hitting:
+                num_generated = sum(num_tokens_generated_per_step)
+                next_t = (
+                    timesteps[:, num_generated + 1]
+                    if num_generated + 1 < timesteps.shape[-1]
+                    else timesteps[:, -1] * 0
+                )
+            else:
+                next_t = (
+                    timesteps[:, i + 1]
+                    if i < timesteps.shape[-1] - 1
+                    else timesteps[:, -1] * 0
+                )
+            masked_positions_indices = masked_positions.nonzero(as_tuple=False)[
+                :, -1
+            ].view(batch_size, -1)
+            if (
+                use_first_hitting_order_in_decode
+                and decode_train_order_ranks is not None
+                and (masked_positions_indices.numel() > 0)
+            ):
+                masked_positions_indices = self._sort_relative_indices_by_train_order(
+                    relative_indices=masked_positions_indices,
+                    train_order_ranks=decode_train_order_ranks,
+                    inputs_offset=int(inputs_offset),
+                )
+            masked_xt = torch.gather(xt, dim=-1, index=masked_positions_indices)
+            masked_position_ids = torch.gather(
+                xt_position_ids, dim=-1, index=masked_positions_indices
+            )
+            unpadded_masked_position_ids = masked_position_ids
+            masked_first_hitting_times = None
+            if (
+                use_first_hitting_order_in_decode or use_fht_cache_order
+            ) and decode_order_first_hitting_times is not None:
+                masked_first_hitting_times = torch.gather(
+                    decode_order_first_hitting_times,
+                    dim=-1,
+                    index=masked_positions_indices,
+                )
+            elif (
+                is_infill_task
+                and infill_cache_promotion_order == "first_hitting"
+                and (infill_cache_first_hitting_times is not None)
+            ):
+                masked_first_hitting_times = torch.gather(
+                    infill_cache_first_hitting_times, dim=-1, index=masked_position_ids
+                )
+            cache_len = cache["past_key_values"].get_seq_length()
+            return_updated_cache = i > 0
+            masked_xt.shape[-1]
+            (denoiser_inputs, cache) = self._prepare_inputs_inference(
+                input_ids=masked_xt,
+                cache=cache,
+                position_ids=masked_position_ids,
+                first_hitting_times=masked_first_hitting_times,
+                return_updated_cache=return_updated_cache,
+            )
+            cache_len = self._get_past_key_values_seq_length(
+                denoiser_inputs.past_key_values
+            )
+            clean_len_value = (
+                self._value_to_int(clean_len) if return_updated_cache else 0
+            )
+            _record_native_uncached_forward_rows(
+                denoiser_inputs.xt,
+                pending_materialization_rows=clean_len_value,
+                row_cap=max_uncached_decode_rows_per_forward,
+                rows_per_forward=uncached_rows_per_forward,
+                components_per_forward=uncached_row_components_per_forward,
+            )
+            active_decode_len = None
+            position_ids_for_sample = denoiser_inputs.backbone_kwargs.get(
+                "position_ids"
+            )
+            if position_ids_for_sample is None:
+                sample_indices = masked_positions_indices + inputs_offset
+            else:
+                sample_indices = position_ids_for_sample[:, clean_len_value:]
+            if not is_infill_task:
+                running_generation = accumulated_samples[
+                    :, first_mask_token_idx:last_mask_token_idx
+                ]
+            else:
+                running_generation = accumulated_samples[cache_flag].unsqueeze(0)
+            repetition_penalty_context = None
+            if is_infill_task and getattr(
+                generation_config,
+                "infill_repetition_penalty_include_right_context",
+                False,
+            ):
+                repetition_penalty_context = self._visible_infill_context(
+                    accumulated_samples=accumulated_samples,
+                    mask_token_id=self.mask_token_id,
+                    pad_token_id=self.pad_token_id,
+                )
+            length_penalty_prefix_lengths = None
+            if logits_processor is not None and len(logits_processor) > 0:
+                length_penalty_prefix_lengths = self._length_penalty_prefix_lengths(
+                    accumulated_samples=accumulated_samples,
+                    sample_indices=sample_indices,
+                    target_start_idx=first_mask_token_idx,
+                    mask_token_id=self.mask_token_id,
+                    pad_token_id=self.pad_token_id,
+                )
+            trace_input_canvas_ids = None
+            trace_verified_mask_before = None
+            trace_conditioning_position_ids = None
+            if generation_trace is not None:
+                trace_input_canvas = accumulated_samples[
+                    0, inputs_offset:last_mask_token_idx
+                ]
+                trace_input_canvas_ids = trace_input_canvas.detach().cpu().tolist()
+                trace_verified_mask_before = trace_input_canvas != self.mask_token_id
+                trace_conditioning_position_ids = (
+                    trace_verified_mask_before.nonzero(as_tuple=False)
+                    .flatten()
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+            generation_output = self._generate_unconditional(
+                generation_config=generation_config,
+                t=t[0],
+                next_t=next_t[0],
+                denoiser_inputs=denoiser_inputs,
+                cache=cache,
+                xt=xt,
+                running_generation=running_generation,
+                repetition_penalty_context=repetition_penalty_context,
+                inputs_offset=inputs_offset,
+                length_penalty_prefix_lengths=length_penalty_prefix_lengths,
+                logits_processor=logits_processor,
+                return_updated_cache=return_updated_cache,
+                cache_len=clean_len,
+                sample_indices=sample_indices,
+                active_decode_len=active_decode_len,
+                window_size=window_size,
+                block_size=num_mask_tokens,
+                confidence_state=confidence_state,
+                trace_top_k=generation_trace_top_k
+                if generation_trace is not None
+                else 0,
+                **kwargs,
+            )
+            (xs, cache) = generation_output
+            sample_confidence = confidence_state.get("sample_confidence")
+            proposal_ids = confidence_state.get("proposal_ids")
+            scheduled_commit_mask = confidence_state.get("scheduled_commit_mask")
+            threshold_commit_mask = confidence_state.get("threshold_commit_mask")
+            trace_top_token_ids = confidence_state.get("top_token_ids")
+            trace_top_probabilities = confidence_state.get("top_probabilities")
+            trace_residual_probability = confidence_state.get("residual_probability")
+            trace_num_to_decode = confidence_state.get("num_to_decode")
+            if return_updated_cache:
+                position_ids = denoiser_inputs.backbone_kwargs["position_ids"]
+                num_cached_position_ids = int(self._value_to_int(clean_len))
+                cached_position_ids = position_ids[:, :num_cached_position_ids]
+                unmasked_position_ids = position_ids[:, num_cached_position_ids:]
+                cache["past_key_values"].crop(cache_len + num_cached_position_ids)
+                if self._KV_CACHE_POSITION_IDS_KEY in cache:
+                    cache[self._KV_CACHE_POSITION_IDS_KEY] = torch.cat(
+                        (cache[self._KV_CACHE_POSITION_IDS_KEY], cached_position_ids),
+                        dim=-1,
+                    )
+                newly_accepted_mask = (
+                    torch.gather(
+                        xt, dim=-1, index=unmasked_position_ids - inputs_offset
+                    )
+                    != xs
+                ) & (xs != self.mask_token_id)
+                clean_len = newly_accepted_mask.sum(dim=-1).min()
+                accumulated_samples.scatter_(1, unmasked_position_ids, xs)
+                if sample_confidence is not None:
+                    confidence_values = sample_confidence.to(accumulated_confidence)
+                    confidence_values = torch.where(
+                        xs != self.mask_token_id,
+                        confidence_values,
+                        torch.full_like(confidence_values, float("nan")),
+                    )
+                    accumulated_confidence.scatter_(
+                        1, unmasked_position_ids, confidence_values
+                    )
+                if is_infill_task or use_first_hitting_order_in_decode:
+                    cache_flag.scatter_(1, cached_position_ids, True)
+                xt.scatter_(1, unmasked_position_ids - inputs_offset, xs)
+                decoded_position_ids = unmasked_position_ids
+            else:
+                xt.scatter_(1, unpadded_masked_position_ids - inputs_offset, xs)
+                newly_accepted_mask = xs != self.mask_token_id
+                clean_len = newly_accepted_mask.sum(dim=-1).min()
+                accumulated_samples.scatter_(1, unpadded_masked_position_ids, xs)
+                if sample_confidence is not None:
+                    confidence_values = sample_confidence.to(accumulated_confidence)
+                    confidence_values = torch.where(
+                        xs != self.mask_token_id,
+                        confidence_values,
+                        torch.full_like(confidence_values, float("nan")),
+                    )
+                    accumulated_confidence.scatter_(
+                        1, unpadded_masked_position_ids, confidence_values
+                    )
+                decoded_position_ids = unpadded_masked_position_ids
+            if generation_stop_sequences:
+                target_values = accumulated_samples[
+                    0, first_mask_token_idx:last_mask_token_idx
+                ]
+                candidate_offsets = []
+                target_length = int(target_values.numel())
+                for stop_sequence in generation_stop_sequences:
+                    sequence_length = len(stop_sequence)
+                    candidate_count = target_length - sequence_length + 1
+                    if candidate_count <= 0:
+                        continue
+                    sequence_matches = torch.ones(
+                        candidate_count, dtype=torch.bool, device=device
+                    )
+                    for offset, stop_token_id in enumerate(stop_sequence):
+                        sequence_matches &= (
+                            target_values[offset : offset + candidate_count]
+                            == stop_token_id
+                        )
+                    match_starts = sequence_matches.nonzero(as_tuple=False).flatten()
+                    if match_starts.numel():
+                        candidate_offsets.append(
+                            int(match_starts.min().item()) + sequence_length - 1
+                        )
+                if candidate_offsets:
+                    candidate_position = self._value_to_int(first_mask_token_idx) + min(
+                        candidate_offsets
+                    )
+                    if (
+                        termination_position is None
+                        or candidate_position < termination_position
+                    ):
+                        termination_position = candidate_position
+                        termination_token_id = int(
+                            accumulated_samples[0, termination_position].item()
+                        )
+                        termination_detected_at_step = i + 1
+                if termination_position is not None:
+                    retained_newly_accepted = newly_accepted_mask & (
+                        decoded_position_ids <= termination_position
+                    )
+                    clean_len = retained_newly_accepted.sum(dim=-1).min()
+                    after_stop = (
+                        torch.arange(accumulated_samples.shape[-1], device=device)
+                        > termination_position
+                    )
+                    accumulated_samples[:, after_stop] = self.mask_token_id
+                    accumulated_confidence[:, after_stop] = float("nan")
+                    target_stop_offset = termination_position - inputs_offset
+                    if target_stop_offset + 1 < xt.shape[-1]:
+                        xt[:, target_stop_offset + 1 :] = self.mask_token_id
+                    cache_flag[:, after_stop] = False
+                    cache_position_ids = cache.get(self._KV_CACHE_POSITION_IDS_KEY)
+                    if cache_position_ids is not None:
+                        keep_indices = (
+                            (cache_position_ids[0] <= termination_position)
+                            .nonzero(as_tuple=False)
+                            .flatten()
+                        )
+                        if int(keep_indices.numel()) < int(
+                            cache_position_ids.shape[-1]
+                        ):
+                            cache["past_key_values"] = self._select_kv_cache_positions(
+                                cache["past_key_values"], keep_indices
+                            )
+                            cache[self._KV_CACHE_POSITION_IDS_KEY] = (
+                                cache_position_ids.index_select(
+                                    dim=-1,
+                                    index=keep_indices.to(cache_position_ids.device),
+                                )
+                            )
+            if generation_trace is not None:
+                accepted = xs != self.mask_token_id
+                relative_position_ids = decoded_position_ids - inputs_offset
+                generation_trace.append(
+                    {
+                        "step": i + 1,
+                        "input_canvas_ids": trace_input_canvas_ids,
+                        "verified_mask_before": trace_verified_mask_before.detach()
+                        .cpu()
+                        .tolist()
+                        if trace_verified_mask_before is not None
+                        else [],
+                        "conditioning_position_ids": trace_conditioning_position_ids
+                        or [],
+                        "active_position_ids": relative_position_ids[0]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "proposal_ids": proposal_ids[0].detach().cpu().tolist()
+                        if proposal_ids is not None
+                        else [],
+                        "proposal_confidence": sample_confidence[0]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .tolist()
+                        if sample_confidence is not None
+                        else [],
+                        "top_token_ids": trace_top_token_ids[0].detach().cpu().tolist()
+                        if trace_top_token_ids is not None
+                        else [],
+                        "top_probabilities": trace_top_probabilities[0]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .tolist()
+                        if trace_top_probabilities is not None
+                        else [],
+                        "residual_probability": trace_residual_probability[0]
+                        .detach()
+                        .float()
+                        .cpu()
+                        .tolist()
+                        if trace_residual_probability is not None
+                        else [],
+                        "scheduled_commit_mask": scheduled_commit_mask[0]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                        if scheduled_commit_mask is not None
+                        else [],
+                        "threshold_commit_mask": threshold_commit_mask[0]
+                        .detach()
+                        .cpu()
+                        .tolist()
+                        if threshold_commit_mask is not None
+                        else [],
+                        "mandatory_decode_count": int(
+                            trace_num_to_decode.flatten()[0].item()
+                        )
+                        if trace_num_to_decode is not None
+                        else None,
+                        "accepted_position_ids": relative_position_ids[0][accepted[0]]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "accepted_token_ids": xs[0][accepted[0]]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "canvas_ids": accumulated_samples[
+                            0, inputs_offset:last_mask_token_idx
+                        ]
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "verified_mask_after": (
+                            accumulated_samples[0, inputs_offset:last_mask_token_idx]
+                            != self.mask_token_id
+                        )
+                        .detach()
+                        .cpu()
+                        .tolist(),
+                        "cache_length_after": int(
+                            cache["past_key_values"].get_seq_length()
+                        ),
+                    }
+                )
+            if is_infill_task and (accumulated_samples == self.mask_token_id).any():
+                just_unmasked_idx = masked_positions & (xt != self.mask_token_id)
+                first_masked_position_id = 0
+                last_potential_position_id = accumulated_samples.shape[-1]
+                just_unmasked_slice = just_unmasked_idx[
+                    :, first_masked_position_id:last_potential_position_id
+                ]
+                accumulated_slice = accumulated_samples[
+                    :, first_masked_position_id:last_potential_position_id
+                ]
+                cache_flag_slice = cache_flag[
+                    :, first_masked_position_id:last_potential_position_id
+                ]
+                masked_positions_slice = masked_positions[
+                    :, first_masked_position_id:last_potential_position_id
+                ]
+                new_cache_positions = None
+                if infill_cache_promotion_order == "l2r" and just_unmasked_slice.any():
+                    position_ids = torch.arange(
+                        last_potential_position_id - first_masked_position_id,
+                        device=device,
+                    )[None, :]
+                    last_newly_unmasked_idx = (
+                        torch.where(
+                            just_unmasked_slice,
+                            position_ids,
+                            torch.full_like(position_ids, -1),
+                        )
+                        .max(dim=-1)
+                        .values[:, None]
+                    )
+                    new_cache_positions = (
+                        (position_ids <= last_newly_unmasked_idx)
+                        & (accumulated_slice != self.mask_token_id)
+                        & ~cache_flag_slice
+                        & ~masked_positions_slice
+                    )
+                    target_unmasking_time = None
+                    cache_first_hitting_times = None
+                elif (
+                    infill_cache_first_hitting_times is not None
+                    and just_unmasked_slice.any()
+                ):
+                    cache_first_hitting_times = infill_cache_first_hitting_times[
+                        :, first_masked_position_id:last_potential_position_id
+                    ]
+                    target_unmasking_time = cache_first_hitting_times[
+                        just_unmasked_slice
+                    ].min()
+                    new_cache_positions = (
+                        (cache_first_hitting_times >= target_unmasking_time)
+                        & (accumulated_slice != self.mask_token_id)
+                        & ~cache_flag_slice
+                        & ~masked_positions_slice
+                    )
+                if new_cache_positions is not None:
+                    clean_len += new_cache_positions.sum()
+                    masked_positions[
+                        :, first_masked_position_id:last_potential_position_id
+                    ] |= new_cache_positions
+                    cache_flag[
+                        :, first_masked_position_id:last_potential_position_id
+                    ] |= new_cache_positions
+            if return_updated_cache:
+                masked_positions.scatter_(1, cached_position_ids - inputs_offset, False)
+            if (
+                use_first_hitting_order_in_decode
+                and decode_train_order_ranks is not None
+            ):
+                (masked_positions, clean_len) = self._train_order_active_mask(
+                    accumulated_samples=accumulated_samples,
+                    cache_flag=cache_flag,
+                    train_order_ranks=decode_train_order_ranks,
+                    target_start_idx=int(input_length),
+                    target_end_idx=int(input_length + max_new_tokens),
+                    inputs_offset=int(inputs_offset),
+                    window_size=int(window_size),
+                    mask_token_id=self.mask_token_id,
+                    pad_token_id=self.pad_token_id,
+                )
+            else:
+                window_start = (
+                    (accumulated_samples == self.mask_token_id)
+                    .float()
+                    .argmax(dim=-1)[:, None]
+                )
+                masked_positions |= (xt == self.mask_token_id) & (
+                    xt_position_ids < window_start + window_size
+                )
+            if termination_position is not None:
+                masked_positions &= xt_position_ids <= termination_position
+                retained_step_tokens = (
+                    (
+                        (xs != self.mask_token_id)
+                        & (decoded_position_ids <= termination_position)
+                    )
+                    .sum()
+                    .item()
+                )
+                target_stop_offset = termination_position - inputs_offset
+                done_decoding = (
+                    xt[:, : target_stop_offset + 1] == self.mask_token_id
+                ).sum().item() == 0
+            else:
+                retained_step_tokens = (xs != self.mask_token_id).sum().item()
+                done_decoding = (xt == self.mask_token_id).sum().item() == 0
+            num_tokens_generated_per_step.append(retained_step_tokens)
+            if done_decoding:
+                break
+            check_stopping_criteria = i % window_size == 0 and i > 0
+            if check_stopping_criteria and stopping_criteria is not None:
+                is_done = stopping_criteria(
+                    input_ids=accumulated_samples[:, : window_start[0] + window_size],
+                    scores=None,
+                    token_confidence=accumulated_confidence[
+                        :, : window_start[0] + window_size
+                    ],
+                )
+                if torch.any(is_done):
+                    if not is_infill_task:
+                        accumulated_samples = accumulated_samples[
+                            :, : window_start[0] + window_size
+                        ]
+                    break
+        if termination_position is not None and (not is_infill_task):
+            accumulated_samples = accumulated_samples[:, : termination_position + 1]
+        if pad_length is not None:
+            accumulated_samples = accumulated_samples[:, :-pad_length]
+        if (
+            not len(uncached_rows_per_forward)
+            == len(uncached_row_components_per_forward)
+            == len(num_tokens_generated_per_step)
+        ):
+            raise RuntimeError(
+                "Native decode row diagnostics do not cover every completed decode forward."
+            )
+        parallelism_factor = sum(num_tokens_generated_per_step) / len(
+            num_tokens_generated_per_step
+        )
+        accumulated_samples = accumulated_samples[
+            accumulated_samples != self.mask_token_id
+        ].unsqueeze(0)
+        if return_dict_in_generate:
+            return DiffusionGenerationOutput(
+                sequences=accumulated_samples,
+                parallelism_factor=parallelism_factor,
+                num_steps=len(num_tokens_generated_per_step),
+                generated_tokens_per_step=tuple(num_tokens_generated_per_step),
+                termination_position=termination_position - inputs_offset
+                if termination_position is not None
+                else None,
+                termination_token_id=termination_token_id,
+                termination_detected_at_step=termination_detected_at_step,
+                uncached_rows_per_forward=tuple(uncached_rows_per_forward),
+                uncached_row_components_per_forward=tuple(
+                    uncached_row_components_per_forward
+                ),
+                max_uncached_rows=max(uncached_rows_per_forward, default=0),
+            )
+        return accumulated_samples
+
+    def _forward(
+        self,
+        backbone_output: torch.FloatTensor,
+        denoiser_inputs: DenoiserInput,
+        **kwargs,
+    ) -> torch.FloatTensor:
+        backbone_output[..., self.mask_token_id] = self.neg_infinity
+        log_probs = backbone_output - torch.logsumexp(
+            backbone_output, dim=-1, keepdim=True
+        )
+        return log_probs

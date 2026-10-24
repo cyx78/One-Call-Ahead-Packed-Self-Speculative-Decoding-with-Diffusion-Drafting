@@ -1,0 +1,40 @@
+{
+  "base": {
+    "linear_w32": {
+      "mean_decode_iteration_model_call_walltime_s": 0.05441018963787608
+    },
+    "quadratic_w8": {
+      "mean_decode_iteration_model_call_walltime_s": 0.0289031408918928
+    },
+    "packed_w32": {
+      "mean_decode_iteration_model_call_walltime_s": 0.028576279210929936
+    }
+  },
+  "lora": {
+    "linear_w32": {
+      "mean_decode_iterations": 27.021986353297955,
+      "samples": 1319,
+      "model_call_walltime_s_by_role": {
+        "causal_verify_clean": 1019.6525540092589,
+        "fresh_diffusion_draft": 1003.7355148766146,
+        "prompt_prefill": 35.87207695897814
+      }
+    },
+    "quadratic_w8": {
+      "mean_decode_iterations": 53.44200151630023,
+      "samples": 1319,
+      "model_call_walltime_s_by_role": {
+        "prompt_prefill_and_quadratic_bootstrap": 44.69557206308309,
+        "quadratic_verify_and_all_position_proposals": 2304.0327624107667
+      }
+    },
+    "packed_w32": {
+      "mean_decode_iterations": 47.43896891584534,
+      "samples": 1319,
+      "model_call_walltime_s_by_role": {
+        "packed_verify_and_next_proposal": 2025.3406213015332,
+        "prompt_prefill_and_packed_bootstrap": 45.47615214407415
+      }
+    }
+  }
+}

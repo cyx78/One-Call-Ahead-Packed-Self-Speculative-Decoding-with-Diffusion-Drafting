@@ -1,0 +1,584 @@
+[
+  {
+    "table": 7,
+    "experiment": "greedy_3B_mbpp",
+    "method": "Linear",
+    "mean_wall_s": "0.379",
+    "tokens_per_s": "173.5",
+    "tokens_per_total_nfe": "3.757",
+    "score_pct": "74.87"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_mbpp",
+    "method": "Quadratic",
+    "mean_wall_s": "0.401",
+    "tokens_per_s": "164.4",
+    "tokens_per_total_nfe": "4.288",
+    "score_pct": "74.34"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_mbpp",
+    "method": "Packed",
+    "mean_wall_s": "0.370",
+    "tokens_per_s": "181.1",
+    "tokens_per_total_nfe": "4.312",
+    "score_pct": "74.60"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_humaneval",
+    "method": "Linear",
+    "mean_wall_s": "0.381",
+    "tokens_per_s": "237.4",
+    "tokens_per_total_nfe": "5.158",
+    "score_pct": "79.27"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_humaneval",
+    "method": "Quadratic",
+    "mean_wall_s": "0.431",
+    "tokens_per_s": "211.5",
+    "tokens_per_total_nfe": "5.536",
+    "score_pct": "79.88"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_humaneval",
+    "method": "Packed",
+    "mean_wall_s": "0.361",
+    "tokens_per_s": "249.7",
+    "tokens_per_total_nfe": "5.971",
+    "score_pct": "78.05"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_gsm8k",
+    "method": "Linear",
+    "mean_wall_s": "0.932",
+    "tokens_per_s": "190.1",
+    "tokens_per_total_nfe": "4.142",
+    "score_pct": "88.40"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_gsm8k",
+    "method": "Quadratic",
+    "mean_wall_s": "0.989",
+    "tokens_per_s": "180.9",
+    "tokens_per_total_nfe": "4.750",
+    "score_pct": "88.25"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_gsm8k",
+    "method": "Packed",
+    "mean_wall_s": "0.888",
+    "tokens_per_s": "201.6",
+    "tokens_per_total_nfe": "4.812",
+    "score_pct": "88.10"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_math500",
+    "method": "Linear",
+    "mean_wall_s": "2.199",
+    "tokens_per_s": "222.4",
+    "tokens_per_total_nfe": "4.928",
+    "score_pct": "55.40"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_math500",
+    "method": "Quadratic",
+    "mean_wall_s": "2.530",
+    "tokens_per_s": "193.1",
+    "tokens_per_total_nfe": "5.229",
+    "score_pct": "58.20"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_math500",
+    "method": "Packed",
+    "mean_wall_s": "2.142",
+    "tokens_per_s": "230.1",
+    "tokens_per_total_nfe": "5.586",
+    "score_pct": "58.40"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_writingbench",
+    "method": "Linear",
+    "mean_wall_s": "5.938",
+    "tokens_per_s": "84.6",
+    "tokens_per_total_nfe": "1.864"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_writingbench",
+    "method": "Quadratic",
+    "mean_wall_s": "5.616",
+    "tokens_per_s": "89.4",
+    "tokens_per_total_nfe": "2.468"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_3B_writingbench",
+    "method": "Packed",
+    "mean_wall_s": "5.441",
+    "tokens_per_s": "92.4",
+    "tokens_per_total_nfe": "2.242"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_mbpp",
+    "method": "Linear",
+    "mean_wall_s": "0.375",
+    "tokens_per_s": "152.0",
+    "tokens_per_total_nfe": "4.421",
+    "score_pct": "85.45"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_mbpp",
+    "method": "Quadratic",
+    "mean_wall_s": "0.440",
+    "tokens_per_s": "134.9",
+    "tokens_per_total_nfe": "4.631",
+    "score_pct": "85.19"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_mbpp",
+    "method": "Packed",
+    "mean_wall_s": "0.369",
+    "tokens_per_s": "158.0",
+    "tokens_per_total_nfe": "5.041",
+    "score_pct": "85.19"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_humaneval",
+    "method": "Linear",
+    "mean_wall_s": "0.481",
+    "tokens_per_s": "195.7",
+    "tokens_per_total_nfe": "5.695",
+    "score_pct": "80.49"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_humaneval",
+    "method": "Quadratic",
+    "mean_wall_s": "0.589",
+    "tokens_per_s": "155.3",
+    "tokens_per_total_nfe": "5.335",
+    "score_pct": "82.32"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_humaneval",
+    "method": "Packed",
+    "mean_wall_s": "0.452",
+    "tokens_per_s": "205.5",
+    "tokens_per_total_nfe": "6.546",
+    "score_pct": "81.71"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_gsm8k",
+    "method": "Linear",
+    "mean_wall_s": "2.459",
+    "tokens_per_s": "127.4",
+    "tokens_per_total_nfe": "3.744",
+    "score_pct": "90.52"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_gsm8k",
+    "method": "Quadratic",
+    "mean_wall_s": "2.553",
+    "tokens_per_s": "122.9",
+    "tokens_per_total_nfe": "4.319",
+    "score_pct": "91.21"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_gsm8k",
+    "method": "Packed",
+    "mean_wall_s": "2.368",
+    "tokens_per_s": "134.3",
+    "tokens_per_total_nfe": "4.300",
+    "score_pct": "90.67"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_math500",
+    "method": "Linear",
+    "mean_wall_s": "4.344",
+    "tokens_per_s": "147.4",
+    "tokens_per_total_nfe": "4.281",
+    "score_pct": "60.40"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_math500",
+    "method": "Quadratic",
+    "mean_wall_s": "4.715",
+    "tokens_per_s": "133.8",
+    "tokens_per_total_nfe": "4.698",
+    "score_pct": "60.20"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_math500",
+    "method": "Packed",
+    "mean_wall_s": "4.079",
+    "tokens_per_s": "155.6",
+    "tokens_per_total_nfe": "4.922",
+    "score_pct": "61.80"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_writingbench",
+    "method": "Linear",
+    "mean_wall_s": "7.587",
+    "tokens_per_s": "66.1",
+    "tokens_per_total_nfe": "1.898"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_writingbench",
+    "method": "Quadratic",
+    "mean_wall_s": "7.420",
+    "tokens_per_s": "67.6",
+    "tokens_per_total_nfe": "2.476"
+  },
+  {
+    "table": 7,
+    "experiment": "greedy_8B_writingbench",
+    "method": "Packed",
+    "mean_wall_s": "7.033",
+    "tokens_per_s": "71.5",
+    "tokens_per_total_nfe": "2.255"
+  },
+  {
+    "table": 4,
+    "experiment": "setdlm_16_LTR",
+    "method": "Linear",
+    "mean_wall_s": "2.709",
+    "tokens_per_s": "94.9",
+    "tokens_per_total_nfe": "2.610",
+    "score_pct": "68.39"
+  },
+  {
+    "table": 4,
+    "experiment": "setdlm_16_LTR",
+    "method": "Quadratic",
+    "mean_wall_s": "2.981",
+    "tokens_per_s": "86.2",
+    "tokens_per_total_nfe": "3.414",
+    "score_pct": "68.39"
+  },
+  {
+    "table": 4,
+    "experiment": "setdlm_16_LTR",
+    "method": "Packed",
+    "mean_wall_s": "2.556",
+    "tokens_per_s": "100.6",
+    "tokens_per_total_nfe": "2.842",
+    "score_pct": "68.39"
+  },
+  {
+    "table": 4,
+    "experiment": "setdlm_32_LTR",
+    "method": "Linear",
+    "mean_wall_s": "2.629",
+    "tokens_per_s": "98.8",
+    "tokens_per_total_nfe": "2.792",
+    "score_pct": "66.57"
+  },
+  {
+    "table": 4,
+    "experiment": "setdlm_32_LTR",
+    "method": "Quadratic",
+    "mean_wall_s": "6.260",
+    "tokens_per_s": "41.6",
+    "tokens_per_total_nfe": "4.074",
+    "score_pct": "66.57"
+  },
+  {
+    "table": 4,
+    "experiment": "setdlm_32_LTR",
+    "method": "Packed",
+    "mean_wall_s": "2.591",
+    "tokens_per_s": "100.3",
+    "tokens_per_total_nfe": "3.030",
+    "score_pct": "66.57"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_mbpp",
+    "method": "Linear",
+    "mean_wall_s": "0.853",
+    "tokens_per_s": "120.4",
+    "tokens_per_total_nfe": "2.508",
+    "score_pct": "68.14"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_mbpp",
+    "method": "Quadratic",
+    "mean_wall_s": "0.843",
+    "tokens_per_s": "129.0",
+    "tokens_per_total_nfe": "3.328",
+    "score_pct": "69.69"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_mbpp",
+    "method": "Packed",
+    "mean_wall_s": "0.814",
+    "tokens_per_s": "125.1",
+    "tokens_per_total_nfe": "2.933",
+    "score_pct": "68.78"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_humaneval",
+    "method": "Linear",
+    "mean_wall_s": "0.571",
+    "tokens_per_s": "169.6",
+    "tokens_per_total_nfe": "3.526",
+    "score_pct": "66.89"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_humaneval",
+    "method": "Quadratic",
+    "mean_wall_s": "0.561",
+    "tokens_per_s": "170.6",
+    "tokens_per_total_nfe": "4.348",
+    "score_pct": "67.29"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_humaneval",
+    "method": "Packed",
+    "mean_wall_s": "0.564",
+    "tokens_per_s": "173.2",
+    "tokens_per_total_nfe": "4.048",
+    "score_pct": "68.35"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_gsm8k",
+    "method": "Linear",
+    "mean_wall_s": "1.439",
+    "tokens_per_s": "137.4",
+    "tokens_per_total_nfe": "2.977",
+    "score_pct": "84.15"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_gsm8k",
+    "method": "Quadratic",
+    "mean_wall_s": "1.416",
+    "tokens_per_s": "140.7",
+    "tokens_per_total_nfe": "3.776",
+    "score_pct": "84.84"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_gsm8k",
+    "method": "Packed",
+    "mean_wall_s": "1.416",
+    "tokens_per_s": "140.1",
+    "tokens_per_total_nfe": "3.428",
+    "score_pct": "83.47"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_math500",
+    "method": "Linear",
+    "mean_wall_s": "3.451",
+    "tokens_per_s": "150.1",
+    "tokens_per_total_nfe": "3.266",
+    "score_pct": "53.80"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_math500",
+    "method": "Quadratic",
+    "mean_wall_s": "3.459",
+    "tokens_per_s": "149.1",
+    "tokens_per_total_nfe": "4.102",
+    "score_pct": "52.00"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_math500",
+    "method": "Packed",
+    "mean_wall_s": "3.369",
+    "tokens_per_s": "155.5",
+    "tokens_per_total_nfe": "3.841",
+    "score_pct": "52.80"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_writingbench",
+    "method": "Linear",
+    "mean_wall_s": "6.654",
+    "tokens_per_s": "75.0",
+    "tokens_per_total_nfe": "1.575"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_writingbench",
+    "method": "Quadratic",
+    "mean_wall_s": "6.355",
+    "tokens_per_s": "78.2",
+    "tokens_per_total_nfe": "2.141"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_3B_writingbench",
+    "method": "Packed",
+    "mean_wall_s": "6.409",
+    "tokens_per_s": "78.0",
+    "tokens_per_total_nfe": "1.890"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_mbpp",
+    "method": "Linear",
+    "mean_wall_s": "1.538",
+    "tokens_per_s": "84.4",
+    "tokens_per_total_nfe": "2.316",
+    "score_pct": "76.76"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_mbpp",
+    "method": "Quadratic",
+    "mean_wall_s": "1.429",
+    "tokens_per_s": "91.2",
+    "tokens_per_total_nfe": "3.062",
+    "score_pct": "74.98"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_mbpp",
+    "method": "Packed",
+    "mean_wall_s": "1.491",
+    "tokens_per_s": "89.6",
+    "tokens_per_total_nfe": "2.752",
+    "score_pct": "75.36"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_humaneval",
+    "method": "Linear",
+    "mean_wall_s": "1.116",
+    "tokens_per_s": "107.8",
+    "tokens_per_total_nfe": "2.944",
+    "score_pct": "70.70"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_humaneval",
+    "method": "Quadratic",
+    "mean_wall_s": "1.082",
+    "tokens_per_s": "111.5",
+    "tokens_per_total_nfe": "3.714",
+    "score_pct": "71.28"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_humaneval",
+    "method": "Packed",
+    "mean_wall_s": "1.040",
+    "tokens_per_s": "114.2",
+    "tokens_per_total_nfe": "3.490",
+    "score_pct": "71.34"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_gsm8k",
+    "method": "Linear",
+    "mean_wall_s": "4.098",
+    "tokens_per_s": "85.7",
+    "tokens_per_total_nfe": "2.341",
+    "score_pct": "87.34"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_gsm8k",
+    "method": "Quadratic",
+    "mean_wall_s": "3.790",
+    "tokens_per_s": "91.9",
+    "tokens_per_total_nfe": "3.109",
+    "score_pct": "86.50"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_gsm8k",
+    "method": "Packed",
+    "mean_wall_s": "3.787",
+    "tokens_per_s": "91.1",
+    "tokens_per_total_nfe": "2.794",
+    "score_pct": "85.29"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_math500",
+    "method": "Linear",
+    "mean_wall_s": "7.230",
+    "tokens_per_s": "90.9",
+    "tokens_per_total_nfe": "2.576",
+    "score_pct": "54.20"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_math500",
+    "method": "Quadratic",
+    "mean_wall_s": "6.879",
+    "tokens_per_s": "95.7",
+    "tokens_per_total_nfe": "3.391",
+    "score_pct": "55.20"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_math500",
+    "method": "Packed",
+    "mean_wall_s": "6.962",
+    "tokens_per_s": "95.5",
+    "tokens_per_total_nfe": "3.047",
+    "score_pct": "54.20"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_writingbench",
+    "method": "Linear",
+    "mean_wall_s": "9.518",
+    "tokens_per_s": "52.6",
+    "tokens_per_total_nfe": "1.433"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_writingbench",
+    "method": "Quadratic",
+    "mean_wall_s": "9.308",
+    "tokens_per_s": "53.3",
+    "tokens_per_total_nfe": "1.940"
+  },
+  {
+    "table": 8,
+    "experiment": "rejection_8B_writingbench",
+    "method": "Packed",
+    "mean_wall_s": "9.006",
+    "tokens_per_s": "55.4",
+    "tokens_per_total_nfe": "1.741"
+  }
+]
